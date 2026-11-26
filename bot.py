@@ -2,14 +2,14 @@ import os
 import re
 import random
 import asyncio
-import sqlite3
 import traceback
 from datetime import datetime
 import pytz
+import psycopg2
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ساخت Event Loop واحد پیش از ساخت کلاینت‌های Pyrofork و PyTgCalls (رفع قطعی پاسخ ندادن ربات)
+# ساخت Event Loop واحد پیش از ساخت کلاینت‌های Pyrofork و PyTgCalls
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -28,12 +28,13 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality
 
 # ============================================================
-# تنظیمات از متغیرهای محیطی (حذف خودکار فاصله‌های اضافه)
+# تنظیمات از متغیرهای محیطی (Render Environment Variables)
 # ============================================================
 API_ID = int(os.environ["API_ID"].strip())
 API_HASH = os.environ["API_HASH"].strip()
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 SESSION_STRING = os.environ["SESSION_STRING"].strip()
+DATABASE_URL = os.environ["DATABASE_URL"].strip()  # لینک Session Pooler از Supabase
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 
@@ -41,51 +42,87 @@ IRAN_TZ = pytz.timezone("Asia/Tehran")
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# وضعیت زنده سیستم برای نمایش در مرورگر و لاگ
 BOT_STATE = {
+    "db": "starting...",
     "bot": "starting...",
     "assistant": "starting...",
     "scheduler": "starting...",
     "last_msg": "هنوز پیامی دریافت نشده",
 }
 
+
 def log(msg: str):
     print(f"[{datetime.now(IRAN_TZ).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 # ============================================================
-# دیتابیس SQLite (آرشیو صوت‌ها و زمان‌بندی‌ها)
+# اتصال دائمی و خودکار به Supabase (PostgreSQL)
 # ============================================================
-conn = sqlite3.connect("audio_bot.db", check_same_thread=False)
-cur = conn.cursor()
+_db_conn = None
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS tracks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    source TEXT NOT NULL,
-    file_id TEXT NOT NULL,
-    duration INTEGER DEFAULT 0
-)
-""")
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS schedules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    track_id INTEGER NOT NULL,
-    run_time TEXT NOT NULL,
-    daily INTEGER DEFAULT 0,
-    last_run_date TEXT DEFAULT ''
-)
-""")
-conn.commit()
+def get_db():
+    global _db_conn
+    if _db_conn is None or _db_conn.closed != 0:
+        kwargs = {"connect_timeout": 10}
+        if "sslmode=" not in DATABASE_URL:
+            kwargs["sslmode"] = "require"
+        _db_conn = psycopg2.connect(DATABASE_URL, **kwargs)
+        _db_conn.autocommit = True
+    return _db_conn
+
+
+def db_query(sql: str, params=(), fetch=None):
+    global _db_conn
+    for attempt in range(2):
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                return cur.rowcount
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            log(f"[DB Reconnect] {e}")
+            try:
+                if _db_conn:
+                    _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
+            if attempt == 1:
+                raise
+
+
+def init_db():
+    db_query("""
+    CREATE TABLE IF NOT EXISTS tracks (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        source TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        duration INTEGER DEFAULT 0
+    )
+    """)
+    db_query("""
+    CREATE TABLE IF NOT EXISTS schedules (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        track_id INTEGER NOT NULL,
+        run_time TEXT NOT NULL,
+        daily INTEGER DEFAULT 0,
+        last_run_date TEXT DEFAULT ''
+    )
+    """)
+
 
 pending_uploads = {}
 active_streams = {}
 
 # ============================================================
-# کلاینت ربات اصلی و کلاینت دستیار ویس‌چت روی همان Loop واحد
+# کلاینت ربات اصلی و کلاینت دستیار ویس‌چت
 # ============================================================
 bot = Client("main_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 assistant = Client("vc_assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True)
@@ -119,20 +156,26 @@ def can_manage(user_id: int) -> bool:
 def find_track(query: str):
     q = en_num(query).strip()
     if q.isdigit():
-        cur.execute("SELECT id, title, source, file_id, duration FROM tracks WHERE id = ?", (int(q),))
-        row = cur.fetchone()
+        row = db_query(
+            "SELECT id, title, source, file_id, duration FROM tracks WHERE id = %s",
+            (int(q),),
+            fetch="one",
+        )
         if row:
             return row
-    cur.execute(
-        "SELECT id, title, source, file_id, duration FROM tracks WHERE lower(title) LIKE ? LIMIT 1",
-        (f"%{q.lower()}%",),
+    return db_query(
+        "SELECT id, title, source, file_id, duration FROM tracks WHERE title ILIKE %s LIMIT 1",
+        (f"%{q}%",),
+        fetch="one",
     )
-    return cur.fetchone()
 
 
 def get_all_tracks(limit=25):
-    cur.execute("SELECT id, title, source, file_id, duration FROM tracks ORDER BY id DESC LIMIT ?", (limit,))
-    return cur.fetchall()
+    return db_query(
+        "SELECT id, title, source, file_id, duration FROM tracks ORDER BY id DESC LIMIT %s",
+        (limit,),
+        fetch="all",
+    )
 
 
 # ============================================================
@@ -290,42 +333,44 @@ async def control_vc(chat_id: int, action: str) -> str:
 # زمان‌بندی خودکار هر دقیقه (به وقت ایران)
 # ============================================================
 async def check_schedules():
-    now_ir = datetime.now(IRAN_TZ)
-    hhmm = now_ir.strftime("%H:%M")
-    today = now_ir.strftime("%Y-%m-%d")
+    try:
+        now_ir = datetime.now(IRAN_TZ)
+        hhmm = now_ir.strftime("%H:%M")
+        today = now_ir.strftime("%Y-%m-%d")
 
-    cur.execute(
-        "SELECT id, chat_id, track_id, run_time, daily, last_run_date FROM schedules WHERE run_time = ?",
-        (hhmm,),
-    )
-    rows = cur.fetchall()
+        rows = db_query(
+            "SELECT id, chat_id, track_id, run_time, daily, last_run_date FROM schedules WHERE run_time = %s",
+            (hhmm,),
+            fetch="all",
+        )
 
-    for sched_id, chat_id, track_id, run_time, daily, last_run_date in rows:
-        if last_run_date == today:
-            continue
+        for sched_id, chat_id, track_id, run_time, daily, last_run_date in rows:
+            if last_run_date == today:
+                continue
 
-        track = find_track(str(track_id))
-        if track:
-            note = (
-                f"⏰ **پخش زمان‌بندی‌شده روزانه (ساعت {fa_num(run_time)})**"
-                if daily
-                else f"⏰ **پخش زمان‌بندی‌شده (ساعت {fa_num(run_time)})**"
-            )
-            if chat_id < 0:
-                await play_in_group_vc(chat_id, track, scheduled_note=note)
-            else:
-                _, title, source, file_id, _ = track
-                await bot.send_message(chat_id, f"{note}\n🎵 **{title}**")
-                if source == "voice":
-                    await bot.send_voice(chat_id, file_id, caption=f"🎙 {title}")
+            track = find_track(str(track_id))
+            if track:
+                note = (
+                    f"⏰ **پخش زمان‌بندی‌شده روزانه (ساعت {fa_num(run_time)})**"
+                    if daily
+                    else f"⏰ **پخش زمان‌بندی‌شده (ساعت {fa_num(run_time)})**"
+                )
+                if chat_id < 0:
+                    await play_in_group_vc(chat_id, track, scheduled_note=note)
                 else:
-                    await bot.send_audio(chat_id, file_id, caption=f"🎵 {title}")
+                    _, title, source, file_id, _ = track
+                    await bot.send_message(chat_id, f"{note}\n🎵 **{title}**")
+                    if source == "voice":
+                        await bot.send_voice(chat_id, file_id, caption=f"🎙 {title}")
+                    else:
+                        await bot.send_audio(chat_id, file_id, caption=f"🎵 {title}")
 
-        if daily:
-            cur.execute("UPDATE schedules SET last_run_date = ? WHERE id = ?", (today, sched_id))
-        else:
-            cur.execute("DELETE FROM schedules WHERE id = ?", (sched_id,))
-        conn.commit()
+            if daily:
+                db_query("UPDATE schedules SET last_run_date = %s WHERE id = %s", (today, sched_id))
+            else:
+                db_query("DELETE FROM schedules WHERE id = %s", (sched_id,))
+    except Exception as e:
+        log(f"[Schedule Error] {e}")
 
 
 # ============================================================
@@ -392,7 +437,7 @@ async def on_inline(client, iq):
 
 
 # ============================================================
-# مدیریت پیام‌های پی‌وی (ذخیره فایل)
+# مدیریت پیام‌های پی‌وی (ذخیره فایل در آرشیو دائمی)
 # ============================================================
 @bot.on_message(filters.private & (filters.voice | filters.audio | filters.document))
 async def on_pv_media(client, msg):
@@ -410,14 +455,14 @@ async def on_pv_media(client, msg):
     caption = (msg.caption or "").strip()
 
     if caption:
-        cur.execute(
-            "INSERT INTO tracks (title, source, file_id, duration) VALUES (?, ?, ?, ?)",
+        row = db_query(
+            "INSERT INTO tracks (title, source, file_id, duration) VALUES (%s, %s, %s, %s) RETURNING id",
             (caption, source, media.file_id, duration),
+            fetch="one",
         )
-        conn.commit()
-        tid = cur.lastrowid
+        tid = row[0]
         await msg.reply_text(
-            f"✅ **صوت در آرشیو ذخیره شد!**\n\n"
+            f"✅ **صوت برای همیشه در آرشیو ذخیره شد!**\n\n"
             f"📌 نام: **{caption}**\n"
             f"🔢 کد پخش: `{tid}`\n\n"
             f"حالا توی گروه بنویس: `پخش {tid}` تا زنده تو ویس‌چت پخش بشه!"
@@ -452,14 +497,14 @@ async def on_text_message(client, msg):
     if is_pv and user_id in pending_uploads and not text.startswith("/") and text not in ("لیست", "راهنما", "وضعیت", "تست", "شروع"):
         info = pending_uploads.pop(user_id)
         title = info["fallback"] if (text == "تایید" and info["fallback"]) else text
-        cur.execute(
-            "INSERT INTO tracks (title, source, file_id, duration) VALUES (?, ?, ?, ?)",
+        row = db_query(
+            "INSERT INTO tracks (title, source, file_id, duration) VALUES (%s, %s, %s, %s) RETURNING id",
             (title, info["source"], info["file_id"], info["duration"]),
+            fetch="one",
         )
-        conn.commit()
-        tid = cur.lastrowid
+        tid = row[0]
         await msg.reply_text(
-            f"✅ **صوت با موفقیت ثبت شد!**\n\n"
+            f"✅ **صوت برای همیشه ثبت شد!**\n\n"
             f"📌 نام: **{title}**\n"
             f"🔢 کد: `{tid}`\n\n"
             f"• پخش زنده در ویس‌چت گروه: `پخش {tid}`\n"
@@ -469,8 +514,7 @@ async def on_text_message(client, msg):
 
     # شروع و منوی پی‌وی
     if is_pv and (text.startswith("/start") or text in ("شروع", "منو")):
-        cur.execute("SELECT COUNT(*) FROM tracks")
-        cnt = cur.fetchone()[0]
+        cnt = db_query("SELECT COUNT(*) FROM tracks", fetch="one")[0]
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🎼 لیست صوت‌ها", callback_data="show_list"),
@@ -483,7 +527,7 @@ async def on_text_message(client, msg):
         await msg.reply_text(
             f"✅ **ربات پخش زنده ویس‌چت فعال و آنلاین است!** 🎧\n\n"
             f"📡 وضعیت اکانت دستیار ویس‌چت: {ast_note}\n"
-            f"📂 تعداد صوت‌های آرشیو: **{fa_num(cnt)} مورد**\n\n"
+            f"💾 آرشیو دائمی (Supabase): **{fa_num(cnt)} صوت ذخیره شده**\n\n"
             "📥 **برای افزودن صوت جدید:** همین‌جا یک ویس، مداحی یا تلاوت قرآن بفرست و اسمش رو تعیین کن.\n"
             "🔴 **پخش زنده در گروه:** در گروه بنویس `پخش [نام یا کد]` تا ویس‌چت به‌صورت فقط شنیداری باز بشه و صوت زنده پخش بشه.\n"
             "⏰ **زمان‌بندی (وقت ایران):** `زمانبندی [کد] 21:30` یا `زمانبندی روزانه [کد] 07:00`",
@@ -493,14 +537,13 @@ async def on_text_message(client, msg):
 
     # وضعیت ربات
     if text in ("وضعیت", "تست") or text.startswith("/status"):
-        cur.execute("SELECT COUNT(*) FROM tracks")
-        t_cnt = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM schedules WHERE chat_id = ?", (chat_id,))
-        s_cnt = cur.fetchone()[0]
+        t_cnt = db_query("SELECT COUNT(*) FROM tracks", fetch="one")[0]
+        s_cnt = db_query("SELECT COUNT(*) FROM schedules WHERE chat_id = %s", (chat_id,), fetch="one")[0]
         now_ir = datetime.now(IRAN_TZ).strftime("%H:%M")
         vc_st = f"🔴 در حال پخش ({active_streams[chat_id]['title']})" if chat_id in active_streams else "⚪️ خاموش"
         await msg.reply_text(
             f"✅ **ربات فعال و آنلاین است!**\n\n"
+            f"💾 دیتابیس: `{BOT_STATE['db']}`\n"
             f"🤖 ربات اصلی: `{BOT_STATE['bot']}`\n"
             f"🎙 اکانت دستیار ویس‌چت: `{BOT_STATE['assistant']}`\n"
             f"🕒 ساعت فعلی ایران: **{fa_num(now_ir)}**\n"
@@ -531,9 +574,8 @@ async def on_text_message(client, msg):
             return
         code = en_num(text[4:].strip())
         if code.isdigit():
-            cur.execute("DELETE FROM tracks WHERE id = ?", (int(code),))
-            conn.commit()
-            await msg.reply_text(f"🗑 صوت کد `{code}` حذف شد." if cur.rowcount else "❌ صوتی با این کد پیدا نشد.")
+            deleted = db_query("DELETE FROM tracks WHERE id = %s", (int(code),))
+            await msg.reply_text(f"🗑 صوت کد `{code}` حذف شد." if deleted else "❌ صوتی با این کد پیدا نشد.")
         return
 
     # لیست آرشیو
@@ -588,13 +630,12 @@ async def on_text_message(client, msg):
             return
 
         run_time = f"{hh:02d}:{mm:02d}"
-        cur.execute(
-            "INSERT INTO schedules (chat_id, track_id, run_time, daily) VALUES (?, ?, ?, ?)",
+        db_query(
+            "INSERT INTO schedules (chat_id, track_id, run_time, daily) VALUES (%s, %s, %s, %s)",
             (chat_id, track[0], run_time, daily),
         )
-        conn.commit()
         await msg.reply_text(
-            f"✅ **زمان‌بندی ثبت شد!**\n\n"
+            f"✅ **زمان‌بندی دائمی ثبت شد!**\n\n"
             f"🎵 صوت: **{track[1]}**\n"
             f"⏰ ساعت: **{fa_num(run_time)}** (وقت ایران)\n"
             f"🔁 نوع: **{'روزانه' if daily else 'یک‌باره'}**"
@@ -603,11 +644,11 @@ async def on_text_message(client, msg):
 
     # لیست زمان‌بندی‌ها
     if text in ("زمانبندی ها", "زمان‌بندی ها", "زمانبندی‌ها"):
-        cur.execute(
-            "SELECT s.id, t.title, s.run_time, s.daily FROM schedules s JOIN tracks t ON s.track_id = t.id WHERE s.chat_id = ?",
+        rows = db_query(
+            "SELECT s.id, t.title, s.run_time, s.daily FROM schedules s JOIN tracks t ON s.track_id = t.id WHERE s.chat_id = %s",
             (chat_id,),
+            fetch="all",
         )
-        rows = cur.fetchall()
         if not rows:
             await msg.reply_text("⏰ زمان‌بندی فعالی برای این چت وجود ندارد.")
             return
@@ -624,7 +665,7 @@ async def send_track_list(chat_id: int, is_pv: bool):
     if not tracks:
         await bot.send_message(chat_id, "📂 آرشیو خالی است! در پی‌وی ربات یک صوت یا ویس بفرستید.")
         return
-    lines = ["🎼 **آرشیو صوت‌ها:**\n"]
+    lines = ["🎼 **آرشیو دائمی صوت‌ها:**\n"]
     btns = []
     for tid, title, _, _, _ in tracks:
         lines.append(f"• کد `{tid}` : **{title}**")
@@ -652,7 +693,7 @@ async def on_callback(client, cb):
         now_ir = datetime.now(IRAN_TZ).strftime("%H:%M")
         await bot.send_message(
             chat_id,
-            f"✅ ربات فعال است!\n🤖 ربات: `{BOT_STATE['bot']}`\n🎙 دستیار: `{BOT_STATE['assistant']}`\n🕒 ساعت ایران: {fa_num(now_ir)}",
+            f"✅ ربات فعال است!\n💾 دیتابیس: `{BOT_STATE['db']}`\n🤖 ربات: `{BOT_STATE['bot']}`\n🎙 دستیار: `{BOT_STATE['assistant']}`\n🕒 ساعت ایران: {fa_num(now_ir)}",
         )
     elif data.startswith("vcplay_"):
         tid = data.replace("vcplay_", "")
@@ -678,8 +719,7 @@ async def on_callback(client, cb):
             await bot.send_audio(chat_id, file_id, caption=f"🎵 **{title}**")
     elif data.startswith("delsched_"):
         sid = int(data.replace("delsched_", ""))
-        cur.execute("DELETE FROM schedules WHERE id = ? AND chat_id = ?", (sid, chat_id))
-        conn.commit()
+        db_query("DELETE FROM schedules WHERE id = %s AND chat_id = %s", (sid, chat_id))
         await cb.answer("🗑 زمان‌بندی حذف شد.")
         await cb.message.edit_reply_markup(None)
 
@@ -689,6 +729,7 @@ async def on_callback(client, cb):
 # ============================================================
 async def health_handler(request):
     body = (
+        f"DB: {BOT_STATE['db']}\n"
         f"Bot: {BOT_STATE['bot']}\n"
         f"Assistant: {BOT_STATE['assistant']}\n"
         f"Scheduler: {BOT_STATE['scheduler']}\n"
@@ -709,10 +750,21 @@ async def start_health_server():
 
 async def main():
     global BOT_USERNAME, ASSISTANT_ID
-    log("=== Starting Telegram VoiceChat Bot ===")
+    log("=== Starting Telegram VoiceChat Bot (Supabase Edition) ===")
     await start_health_server()
 
-    # ۱. اتصال ربات اصلی (مستقل از دستیار تا همیشه پاسخ بدهد)
+    # ۱. اتصال به دیتابیس Supabase و ساخت خودکار جداول
+    try:
+        log("Connecting to Supabase PostgreSQL...")
+        init_db()
+        BOT_STATE["db"] = "OK (Supabase PostgreSQL)"
+        log("Supabase DB connected and tables ready.")
+    except Exception as e:
+        BOT_STATE["db"] = f"ERROR: {e}"
+        log(f"[FATAL] Database failed: {e}")
+        traceback.print_exc()
+
+    # ۲. اتصال ربات اصلی
     try:
         log("Connecting main bot...")
         await bot.start()
@@ -725,7 +777,7 @@ async def main():
         log(f"[FATAL] Main bot failed: {e}")
         traceback.print_exc()
 
-    # ۲. اتصال اکانت دستیار و موتور ویس‌چت
+    # ۳. اتصال اکانت دستیار و موتور ویس‌چت
     try:
         log("Connecting assistant & PyTgCalls...")
         await call_py.start()
@@ -740,7 +792,7 @@ async def main():
         log(f"[ERROR] Assistant/PyTgCalls failed: {e}")
         traceback.print_exc()
 
-    # ۳. شروع زمان‌بند
+    # ۴. شروع زمان‌بند
     scheduler.add_job(check_schedules, "cron", second=0)
     scheduler.start()
     BOT_STATE["scheduler"] = "OK"
